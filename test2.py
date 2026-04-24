@@ -15,7 +15,7 @@ AUTHOR: Senior Scraping Engineer
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field, ConfigDict
 import json
 import time
@@ -66,7 +66,7 @@ class UniversalProductScraper:
         self.browser = None
         self.context = None
         self.page = None
-        
+
     def __enter__(self):
         """Context manager entry"""
         self.playwright = sync_playwright().start()
@@ -511,48 +511,27 @@ class UniversalProductScraper:
     # PHASE 5: PAGINATION EXECUTION
     # ========================================================================
     
-    def execute_dynamic_pagination(self, max_pages: int = 30) -> None:
+    def execute_dynamic_pagination(self, max_pages: int = 30) -> List[str]:
         """
         Dynamically handles BOTH scrolling and 'Load More' buttons in a single hybrid loop.
         Many modern sites scroll for a few pages, then show a button, then scroll again.
         """
         print(f"\n🔄 Executing dynamic pagination (max {max_pages} pages)...")
+        visited_urls = [self.page.url]
         
         for i in range(max_pages):
             before_count = len(self.detect_product_containers())
-            
-            # 1. Try to find and click a 'Load More' button first
-            button_clicked = self.page.evaluate("""
-                () => {
-                    const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]'));
-                    const keywords = ['next', 'more', 'load more', 'show more', 'view more', 'discover'];
-                    
-                    for (const btn of buttons) {
-                        const text = (btn.innerText || '').toLowerCase();
-                        if (keywords.some(kw => text.includes(kw)) && btn.offsetParent !== null) {
-                            btn.scrollIntoView({behavior: 'smooth', block: 'center'});
-                            // Dispatch standard click event to bypass strict framework listeners
-                            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-            """)
-            
-            if button_clicked:
-                print("  🔘 Clicked 'Load More' button...")
-                time.sleep(2)
-            
-            # 2. Perform a smooth scroll to trigger lazy loaders and Intersection Observers
+            before_url = self.page.url
+
+            # Step 1: Scroll first so bottom pagination controls become visible.
             self.page.evaluate("""
                 async () => {
                     await new Promise((resolve) => {
                         let totalHeight = 0;
                         const distance = 600;
                         let scrolls = 0;
-                        const maxScrolls = 15; // Prevent infinite scroll lock
-                        
+                        const maxScrolls = 15;
+
                         const timer = setInterval(() => {
                             const scrollHeight = document.body.scrollHeight;
                             window.scrollBy(0, distance);
@@ -567,31 +546,166 @@ class UniversalProductScraper:
                     });
                 }
             """)
+
+            # Step 2: Prefer "load more" click behavior.
+            button_clicked = self.page.evaluate("""
+                () => {
+                    const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]'));
+                    const keywords = ['load more', 'show more', 'view more', 'more products', 'discover more'];
+
+                    for (const btn of buttons) {
+                        const text = ((btn.innerText || '').trim().toLowerCase() + ' ' + (btn.getAttribute('aria-label') || '').toLowerCase());
+                        if (keywords.some(kw => text.includes(kw)) && btn.offsetParent !== null) {
+                            btn.scrollIntoView({behavior: 'smooth', block: 'center'});
+                            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+
+            if button_clicked:
+                print("  🔘 Clicked 'Load More' button...")
+                time.sleep(2)
+
+            # Step 3: If load-more didn't progress, then try link-based pagination.
+            link_target = None
+            if not button_clicked:
+                link_target = self.page.evaluate("""
+                () => {
+                    const candidates = Array.from(document.querySelectorAll('a[rel="next"], a, button'));
+                    const currentUrl = new URL(window.location.href);
+                    const blockedPathKeywords = ['account', 'login', 'signin', 'register', 'cart', 'checkout', 'customer'];
+
+                    const isVisible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return el.offsetParent !== null && rect.width > 0 && rect.height > 0;
+                    };
+
+                    const isSafeHref = (href) => {
+                        if (!href) return false;
+                        try {
+                            const u = new URL(href, window.location.href);
+                            if (u.origin !== currentUrl.origin) return false;
+                            const path = u.pathname.toLowerCase();
+                            if (blockedPathKeywords.some(k => path.includes(k))) return false;
+
+                            // Keep same collection/catalog path as strong signal.
+                            const samePath = (u.pathname === currentUrl.pathname);
+                            const pageParam = u.searchParams.has('page') || u.searchParams.has('p') || u.searchParams.has('offset');
+                            return samePath || pageParam;
+                        } catch {
+                            return false;
+                        }
+                    };
+
+                    const getText = (el) => ((el.innerText || '').trim().toLowerCase() + ' ' + (el.getAttribute('aria-label') || '').toLowerCase());
+
+                    // 1) standards-based rel=next
+                    for (const el of candidates) {
+                        if (!isVisible(el)) continue;
+                        if (el.matches('a[rel="next"]') && isSafeHref(el.href)) return { mode: 'goto', value: el.href };
+                    }
+
+                    // 2) semantic next controls
+                    const keywords = ['next', 'load more', 'show more', 'view more', 'older', '→', '›'];
+                    for (const el of candidates) {
+                        if (!isVisible(el)) continue;
+                        const txt = getText(el);
+                        if (keywords.some(k => txt.includes(k))) {
+                            if (el.tagName.toLowerCase() === 'a' && isSafeHref(el.href)) return { mode: 'goto', value: el.href };
+                            return { mode: 'click', value: null };
+                        }
+                    }
+
+                    // 3) numbered pagination: click next numeric after current page
+                    const numeric = candidates
+                        .filter(el => isVisible(el))
+                        .map(el => ({
+                            el,
+                            text: (el.innerText || '').trim(),
+                            current: el.getAttribute('aria-current') === 'page' || el.classList.contains('active') || el.classList.contains('current')
+                        }))
+                        .filter(x => /^\d+$/.test(x.text));
+
+                    const currentNumeric = numeric.find(x => x.current);
+                    if (currentNumeric) {
+                        const nextNum = String(parseInt(currentNumeric.text, 10) + 1);
+                        const target = numeric.find(x => x.text === nextNum);
+                        if (target) {
+                            if (target.el.tagName.toLowerCase() === 'a' && isSafeHref(target.el.href)) return { mode: 'goto', value: target.el.href };
+                            return { mode: 'click', value: null };
+                        }
+                    }
+
+                    return null;
+                }
+            """)
+
+                if link_target:
+                    print("  📄 Triggered link-based pagination...")
+                    if link_target.get('mode') == 'goto' and link_target.get('value'):
+                        try:
+                            self.page.goto(link_target['value'], wait_until="domcontentloaded", timeout=self.timeout)
+                            self.page.wait_for_load_state("networkidle", timeout=12000)
+                        except PlaywrightTimeout:
+                            time.sleep(2)
+                    else:
+                        self.page.evaluate("""
+                            () => {
+                                const candidates = Array.from(document.querySelectorAll('a, button'));
+                                const blockedWords = ['account', 'login', 'sign in', 'register', 'cart', 'checkout'];
+                                const isVisible = (el) => {
+                                    const rect = el.getBoundingClientRect();
+                                    return el.offsetParent !== null && rect.width > 0 && rect.height > 0;
+                                };
+                                const keywords = ['next', 'load more', 'show more', 'view more', 'older', '→', '›'];
+                                for (const el of candidates) {
+                                    if (!isVisible(el)) continue;
+                                    const txt = ((el.innerText || '').trim().toLowerCase() + ' ' + (el.getAttribute('aria-label') || '').toLowerCase());
+                                    if (blockedWords.some(k => txt.includes(k))) continue;
+                                    if (keywords.some(k => txt.includes(k))) {
+                                        el.click();
+                                        return;
+                                    }
+                                }
+                            }
+                        """)
+                        time.sleep(2)
             
-            # 3. Poll actively for container count to increase (handles slow network)
+            # Step 4: Poll actively for container count/url change.
             waited = 0
             new_count = before_count
             while waited < 8:  # Wait up to 8 seconds for network
                 time.sleep(2)
                 waited += 2
                 new_count = len(self.detect_product_containers())
-                if new_count > before_count:
+                if new_count > before_count or self.page.url != before_url:
                     break
             
-            # 4. Wiggle fallback if stuck
-            if new_count == before_count:
+            # Step 5: Wiggle fallback if still stuck.
+            if new_count == before_count and self.page.url == before_url:
                 self.page.evaluate("window.scrollBy(0, -800);")
                 time.sleep(1)
                 self.page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(3)
                 new_count = len(self.detect_product_containers())
             
-            # 5. Check iteration results
+            # Step 6: Check iteration results.
+            after_url = self.page.url
+            if after_url not in visited_urls:
+                visited_urls.append(after_url)
+
             if new_count > before_count:
                 print(f"  Page {i + 1}: {before_count} → {new_count} products")
+            elif after_url != before_url:
+                print(f"  Page {i + 1}: navigated to next page ({after_url})")
             else:
                 print(f"  ✅ Reached end of catalog after {i + 1} pages")
                 break
+
+        return visited_urls
     
     # ========================================================================
     # MAIN SCRAPING ORCHESTRATOR
@@ -651,33 +765,40 @@ class UniversalProductScraper:
         pagination_method = self.detect_pagination_method()
         
         # Step 5: Execute universal dynamic pagination
-        self.execute_dynamic_pagination()
-        
+        visited_urls = self.execute_dynamic_pagination()
+
         # Step 6: Re-extract all products after full pagination
         print(f"\n📦 Finalizing extraction of all loaded products...")
-        container_xpaths = self.detect_product_containers()
-        all_products = []
+        all_products_with_id: List[Tuple[Product, str]] = []
         failed_extractions = 0
-        
-        for i, xpath in enumerate(container_xpaths, 1):
-            product = self.extract_product_from_container(xpath)
-            if product:
-                all_products.append(product)
-            else:
-                failed_extractions += 1
+
+        # For numbered pagination, collect from each visited page URL.
+        for page_idx, page_url in enumerate(visited_urls, 1):
+            if self.page.url != page_url:
+                self.load_page_intelligently(page_url)
+
+            container_xpaths = self.detect_product_containers()
+            print(f"  Page snapshot {page_idx}/{len(visited_urls)}: {len(container_xpaths)} containers")
+
+            for i, xpath in enumerate(container_xpaths, 1):
+                product = self.extract_product_from_container(xpath)
+                if product:
+                    all_products_with_id.append((product, f"{page_idx}:{i}:{xpath}"))
+                else:
+                    failed_extractions += 1
+                    
+                if i % 20 == 0:
+                    print(f"  Processed {i}/{len(container_xpaths)} containers...")
                 
-            if i % 20 == 0:
-                print(f"  Processed {i}/{len(container_xpaths)} containers...")
-                
-        print(f"  ✅ Successfully extracted {len(all_products)} products ({failed_extractions} containers skipped)")
+        print(f"  ✅ Successfully extracted {len(all_products_with_id)} products ({failed_extractions} containers skipped)")
         
         # Step 7: Deduplicate products (by name + price + url + image)
         print(f"\n🧹 Deduplicating products...")
         unique_products = {}
         duplicates_dropped = 0
         
-        for product in all_products:
-            # Create a more robust key using url and image to prevent dropping variants
+        for product, _ in all_products_with_id:
+            # Keep original straightforward dedupe identity to avoid false merges.
             key = f"{product.name}_{product.price}_{product.product_url}_{product.image_url}"
             if key not in unique_products:
                 unique_products[key] = product
