@@ -550,7 +550,7 @@ class UniversalProductScraper:
             link_target = self.page.evaluate("""
                 () => {
                     const candidates = Array.from(document.querySelectorAll('a[rel="next"], a, button'));
-                    const current = new URL(window.location.href);
+                    const currentUrl = new URL(window.location.href);
                     const blockedPathKeywords = ['account', 'login', 'signin', 'register', 'cart', 'checkout', 'customer'];
 
                     const isVisible = (el) => {
@@ -562,12 +562,12 @@ class UniversalProductScraper:
                         if (!href) return false;
                         try {
                             const u = new URL(href, window.location.href);
-                            if (u.origin !== current.origin) return false;
+                            if (u.origin !== currentUrl.origin) return false;
                             const path = u.pathname.toLowerCase();
                             if (blockedPathKeywords.some(k => path.includes(k))) return false;
 
                             // Keep same collection/catalog path as strong signal.
-                            const samePath = (u.pathname === current.pathname);
+                            const samePath = (u.pathname === currentUrl.pathname);
                             const pageParam = u.searchParams.has('page') || u.searchParams.has('p') || u.searchParams.has('offset');
                             return samePath || pageParam;
                         } catch {
@@ -604,9 +604,9 @@ class UniversalProductScraper:
                         }))
                         .filter(x => /^\d+$/.test(x.text));
 
-                    const current = numeric.find(x => x.current);
-                    if (current) {
-                        const nextNum = String(parseInt(current.text, 10) + 1);
+                    const currentNumeric = numeric.find(x => x.current);
+                    if (currentNumeric) {
+                        const nextNum = String(parseInt(currentNumeric.text, 10) + 1);
                         const target = numeric.find(x => x.text === nextNum);
                         if (target) {
                             if (target.el.tagName.toLowerCase() === 'a' && isSafeHref(target.el.href)) return { mode: 'goto', value: target.el.href };
